@@ -1,0 +1,93 @@
+"""
+Generate YOLO labels (Invoice-No, Date, Company, Total)
+by matching Task-2 field values to Task-1 word boxes.
+Requires: pip install fuzzywuzzy python-Levenshtein
+"""
+
+import json, re, os
+from pathlib import Path
+from PIL import Image
+from fuzzywuzzy import fuzz
+
+# ─── CONFIG ─────────────────────────────────────────────
+TASK1_DIR   = Path("data/0325updated.task1train(626p)")  # word boxes
+TASK2_DIR   = Path("data/0325updated.task2train(626p)")  # key-field files
+DATASET_DIR = Path("dataset")                            # images / labels split
+CLS = {"invoice number":0, "invoicenumber":0,
+       "date":1, "company":2, "vendor":2, "total":3}
+THRESH = 80                                              # fuzzy score cut-off
+# ─────────────────────────────────────────────────────────
+
+def norm(t):                # lowercase, strip punctuation
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+def read_task1(txt):
+    out=[]
+    for ln in txt.read_text(encoding="utf-8",errors="ignore").splitlines():
+        p = ln.split(",",8)
+        if len(p)<9: continue
+        x1,y1,x2,y2 = map(int,p[:4])          # axis-aligned OK for SROIE
+        out.append({"box":[x1,y1,x2,y2], "txt":p[8].strip()})
+    return out
+
+def read_task2(f):
+    try:
+        d=json.loads(f.read_text());             assert isinstance(d,dict)
+        return {k.lower():str(v) for k,v in d.items()}
+    except:
+        d={}
+        for ln in f.read_text().splitlines():
+            if ":" in ln:
+                k,v=ln.split(":",1)
+                d[k.lower().strip()]=v.strip()
+        return d
+
+def find_match(value, words):
+    val_n = norm(value)
+    # 1) exact substring
+    for w in words:
+        if val_n in norm(w["txt"]):
+            return w,100
+    # 2) fuzzy fallback
+    best,best_s=None,0
+    for w in words:
+        s = fuzz.ratio(val_n, norm(w["txt"]))
+        if s>best_s:
+            best,best_s=w,s
+    return (best,best_s) if best_s>=THRESH else (None,best_s)
+
+# loop splits
+for split in ("train","val","test"):
+    img_fold = DATASET_DIR/"images"/split
+    lab_fold = DATASET_DIR/"labels"/split
+    lab_fold.mkdir(parents=True,exist_ok=True)
+
+    for img in img_fold.glob("*.jpg"):
+        tid = img.stem
+        t1  = TASK1_DIR/f"{tid}.txt"
+        t2  = TASK2_DIR/f"{tid}.txt"
+        if not (t1.exists() and t2.exists()): continue
+
+        words = read_task1(t1)
+        fields= read_task2(t2)
+
+        W,H   = Image.open(img).size
+        yolo  = []
+
+        for k,v in fields.items():
+            key = k.replace(" ","")
+            cls = CLS.get(key)
+            if cls is None: continue
+            m,score = find_match(v,words)
+            if not m: 
+                print(f"⚠️  {split}/{tid}: no box for {k}='{v}'")
+                continue
+            x1,y1,x2,y2 = m["box"]
+            cx,cy = (x1+x2)/2/W,(y1+y2)/2/H
+            bw,bh = (x2-x1)/W,(y2-y1)/H
+            yolo.append(f"{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+        (lab_fold/f"{tid}.txt").write_text("\n".join(yolo))
+        print(f"✓ {split}/{tid}.txt  fields:{len(yolo)}")
+
+print("✅ YOLO label generation finished.")
